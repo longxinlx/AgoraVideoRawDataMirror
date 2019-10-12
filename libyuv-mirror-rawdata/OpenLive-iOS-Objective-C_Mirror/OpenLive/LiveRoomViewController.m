@@ -9,18 +9,19 @@
 #import "LiveRoomViewController.h"
 #import "VideoSession.h"
 #import "VideoViewLayouter.h"
+#import "BeautyEffectTableViewController.h"
 #import "KeyCenter.h"
 #import "AGVideoPreProcessing.h"
 
-@interface LiveRoomViewController () <AgoraRtcEngineDelegate>
+@interface LiveRoomViewController () <AgoraRtcEngineDelegate, BeautyEffectTableVCDelegate, UIPopoverPresentationControllerDelegate>
 @property (weak, nonatomic) IBOutlet UILabel *roomNameLabel;
 @property (weak, nonatomic) IBOutlet UIView *remoteContainerView;
 @property (weak, nonatomic) IBOutlet UIButton *broadcastButton;
 @property (strong, nonatomic) IBOutletCollection(UIButton) NSArray *sessionButtons;
 @property (weak, nonatomic) IBOutlet UIButton *audioMuteButton;
-@property (weak, nonatomic) IBOutlet UIButton *enhancerButton;
+@property (weak, nonatomic) IBOutlet UIButton *beautyEffectButton;
+@property (weak, nonatomic) IBOutlet UIButton *superResolutionButton;
 
-@property (strong, nonatomic) AgoraRtcEngineKit *rtcEngine;
 @property (assign, nonatomic) BOOL isBroadcaster;
 @property (assign, nonatomic) BOOL isMuted;
 @property (assign, nonatomic) BOOL isMirror;
@@ -28,6 +29,10 @@
 @property (strong, nonatomic) NSMutableArray<VideoSession *> *videoSessions;
 @property (strong, nonatomic) VideoSession *fullSession;
 @property (strong, nonatomic) VideoViewLayouter *viewLayouter;
+@property (assign, nonatomic) BOOL isEnableSuperResolution;
+@property (assign, nonatomic) NSUInteger highPriorityRemoteUid;
+@property (assign, nonatomic) BOOL isBeautyOn;
+@property (strong, nonatomic) AgoraBeautyOptions *beautyOptions;
 @end
 
 @implementation LiveRoomViewController
@@ -72,6 +77,31 @@
     }
 }
 
+- (void)setIsEnableSuperResolution:(BOOL)isEnableSuperResolution {
+    _isEnableSuperResolution = isEnableSuperResolution;
+    [self.superResolutionButton setImage:[UIImage imageNamed:_isEnableSuperResolution ? @"btn_sr_blue" : @"btn_sr"] forState:UIControlStateNormal];
+}
+
+- (void)setHighPriorityRemoteUid:(NSUInteger)highPriorityRemoteUid {
+    _highPriorityRemoteUid = highPriorityRemoteUid;
+    for (VideoSession *session in self.videoSessions) {
+        [self.rtcEngine enableRemoteSuperResolution:session.uid enabled:NO];
+        [self.rtcEngine setRemoteUserPriority:session.uid type:AgoraUserPriorityNormal];
+    }
+    if (highPriorityRemoteUid != 0) {
+        if (self.isEnableSuperResolution) {
+            [self.rtcEngine enableRemoteSuperResolution:highPriorityRemoteUid enabled:YES];
+        }
+        [self.rtcEngine setRemoteUserPriority:highPriorityRemoteUid type:AgoraUserPriorityHigh];
+    }
+}
+
+- (void)setIsBeautyOn:(BOOL)isBeautyOn {
+    _isBeautyOn = isBeautyOn;
+    [self.rtcEngine setBeautyEffectOptions:isBeautyOn options:self.beautyOptions];
+    [self.beautyEffectButton setImage:[UIImage imageNamed:(isBeautyOn ? @"btn_beautiful_cancel" : @"btn_beautiful")] forState:UIControlStateNormal];
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.videoSessions = [[NSMutableArray alloc] init];
@@ -80,6 +110,27 @@
     [self updateButtonsVisiablity];
     
     [self loadAgoraKit];
+    
+    self.beautyOptions = [[AgoraBeautyOptions alloc] init];
+    self.beautyOptions.lighteningContrastLevel = AgoraLighteningContrastNormal;
+    self.beautyOptions.lighteningLevel = 0.7;
+    self.beautyOptions.smoothnessLevel = 0.5;
+    self.beautyOptions.rednessLevel = 0.1;
+    
+    self.isBeautyOn = YES;
+}
+
+- (void)prepareForSegue:(UIStoryboardSegue *)segue sender:(id)sender {
+    if ([segue.identifier isEqualToString:@"roomVCPopBeautyList"]) {
+        BeautyEffectTableViewController *vc = segue.destinationViewController;
+        vc.isBeautyOn = self.isBeautyOn;
+        vc.smoothness = self.beautyOptions.smoothnessLevel;
+        vc.lightening = self.beautyOptions.lighteningLevel;
+        vc.contrast = self.beautyOptions.lighteningContrastLevel;
+        vc.redness = self.beautyOptions.rednessLevel;
+        vc.delegate = self;
+        vc.popoverPresentationController.delegate = self;
+    }
 }
 
 - (IBAction)doSwitchCameraPressed:(UIButton *)sender {
@@ -102,6 +153,11 @@
     
     [self.rtcEngine setClientRole:self.clientRole];
     [self updateInterfaceWithAnimation:YES];
+}
+
+- (IBAction)doSuperResolutionPressed:(UIButton *)sender {
+    self.isEnableSuperResolution = !self.isEnableSuperResolution;
+    self.highPriorityRemoteUid = [self highPriorityRemoteUidInSessions:self.videoSessions fullSession:self.fullSession];
 }
 
 - (IBAction)doDoubleTapped:(UITapGestureRecognizer *)sender {
@@ -127,8 +183,9 @@
 }
 
 - (IBAction)mirrorRemoteVideo:(UIButton *)sender {
+    NSLog(@"mirrorRemoteVideo -------");
     self.isMirror = !self.isMirror;
-    [self.rtcEngine setParameters:@"{\"che.video.local.render\":false}"];
+    [self.rtcEngine setParameters:@"{\"che.video.local.render\":false}"]; // 本地预览保持不变
     if (self.isMirror) {
         [self.rtcEngine setLocalVideoMirrorMode:AgoraVideoMirrorModeDisabled];
         [AGVideoPreProcessing setMirrorVideo:YES];
@@ -139,7 +196,7 @@
         [AGVideoPreProcessing setMirrorVideo:NO];
         [sender setTitle:@"unmirror" forState:UIControlStateNormal];
     }
-    [self.rtcEngine setParameters:@"{\"che.video.local.render\":true}"];
+    [self.rtcEngine setParameters:@"{\"che.video.local.render\":true}"]; // 本地预览保持不变
 }
 
 - (void)leaveChannel {
@@ -198,12 +255,17 @@
     
     [self.viewLayouter layoutSessions:displaySessions fullSession:self.fullSession inContainer:self.remoteContainerView];
     [self setStreamTypeForSessions:displaySessions fullSession:self.fullSession];
+    self.highPriorityRemoteUid = [self highPriorityRemoteUidInSessions:displaySessions fullSession:self.fullSession];
 }
 
 - (void)setStreamTypeForSessions:(NSArray<VideoSession *> *)sessions fullSession:(VideoSession *)fullSession {
     if (fullSession) {
         for (VideoSession *session in sessions) {
-            [self.rtcEngine setRemoteVideoStream:session.uid type:(session == self.fullSession ? AgoraVideoStreamTypeHigh : AgoraVideoStreamTypeLow)];
+            if (session == self.fullSession) {
+                [self.rtcEngine setRemoteVideoStream:fullSession.uid type:AgoraVideoStreamTypeHigh];
+            } else {
+                [self.rtcEngine setRemoteVideoStream:session.uid type:AgoraVideoStreamTypeLow];
+            }
         }
     } else {
         for (VideoSession *session in sessions) {
@@ -240,14 +302,30 @@
     }
 }
 
+- (NSUInteger)highPriorityRemoteUidInSessions:(NSArray<VideoSession *> *)sessions fullSession:(VideoSession *)fullSession {
+    if (fullSession) {
+        return fullSession.uid;
+    } else {
+        return sessions.lastObject.uid;
+    }
+}
+
 //MARK: - Agora Media SDK
 - (void)loadAgoraKit {
-    self.rtcEngine = [AgoraRtcEngineKit sharedEngineWithAppId:[KeyCenter AppId] delegate:self];
-    [AGVideoPreProcessing registerVideoPreprocessing:self.rtcEngine];
+    self.rtcEngine.delegate = self;
     [self.rtcEngine setChannelProfile:AgoraChannelProfileLiveBroadcasting];
-    [self.rtcEngine enableDualStreamMode:YES];
+    [AGVideoPreProcessing registerVideoPreprocessing:self.rtcEngine];
+//    [self.rtcEngine enableDualStreamMode:YES];
     [self.rtcEngine enableVideo];
-    [self.rtcEngine setVideoProfile:self.videoProfile swapWidthAndHeight:YES];
+    
+//    [self.rtcEngine setVideoProfile:self.videoProfile swapWidthAndHeight:YES];
+    AgoraVideoEncoderConfiguration *configuration =
+         [[AgoraVideoEncoderConfiguration alloc] initWithSize:self.videoProfile
+                                                    frameRate:AgoraVideoFrameRateFps24
+                                                      bitrate:AgoraVideoBitrateStandard
+                                              orientationMode:AgoraVideoOutputOrientationModeAdaptative];
+     [self.rtcEngine setVideoEncoderConfiguration:configuration];
+    
     [self.rtcEngine setClientRole:self.clientRole];
     
     if (self.isBroadcaster) {
@@ -256,7 +334,7 @@
     
     [self addLocalSession];
     
-    int code = [self.rtcEngine joinChannelByToken:nil channelId:self.roomName info:nil uid:0 joinSuccess:nil];
+    int code = [self.rtcEngine joinChannelByToken:[KeyCenter Token] channelId:self.roomName info:nil uid:0 joinSuccess:nil];
     if (code == 0) {
         [self setIdleTimerActive:NO];
     } else {
@@ -298,5 +376,19 @@
             self.fullSession = nil;
         }
     }
+}
+
+//MARK: - enhancer
+- (void)beautyEffectTableVCDidChange:(BeautyEffectTableViewController *)enhancerTableVC {
+    self.beautyOptions.lighteningLevel = enhancerTableVC.lightening;
+    self.beautyOptions.smoothnessLevel = enhancerTableVC.smoothness;
+    self.beautyOptions.lighteningContrastLevel = enhancerTableVC.contrast;
+    self.beautyOptions.rednessLevel = enhancerTableVC.redness;
+    self.isBeautyOn = enhancerTableVC.isBeautyOn;
+}
+
+//MARK: - vc
+- (UIModalPresentationStyle)adaptivePresentationStyleForPresentationController:(UIPresentationController *)controller traitCollection:(UITraitCollection *)traitCollection {
+    return UIModalPresentationNone;
 }
 @end
